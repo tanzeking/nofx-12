@@ -1,0 +1,88 @@
+ARG GO_VERSION=1.21-alpine
+ARG NODE_VERSION=20-alpine
+ARG ALPINE_VERSION=latest
+ARG TA_LIB_VERSION=0.4.0
+
+FROM node:${NODE_VERSION} AS web-builder
+WORKDIR /build
+COPY web/package*.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+FROM alpine:${ALPINE_VERSION} AS ta-lib-builder
+ARG TA_LIB_VERSION
+RUN apk update && apk add --no-cache wget tar make gcc g++ musl-dev autoconf automake
+WORKDIR /tmp
+RUN wget --no-check-certificate https://sourceforge.net/projects/ta-lib/files/ta-lib/${TA_LIB_VERSION}/ta-lib-${TA_LIB_VERSION}-src.tar.gz/download -O ta-lib-${TA_LIB_VERSION}-src.tar.gz || \
+    wget https://downloads.sourceforge.net/project/ta-lib/ta-lib/${TA_LIB_VERSION}/ta-lib-${TA_LIB_VERSION}-src.tar.gz -O ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
+    tar -xzf ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
+    cd ta-lib && \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        CONFIG_GUESS=$(find /usr/share -name config.guess | head -1) && \
+        CONFIG_SUB=$(find /usr/share -name config.sub | head -1) && \
+        cp "$CONFIG_GUESS" config.guess && \
+        cp "$CONFIG_SUB" config.sub && \
+        chmod +x config.guess config.sub; \
+    fi && \
+    ./configure --prefix=/usr/local && \
+    make && make install && \
+    cd .. && rm -rf ta-lib ta-lib-${TA_LIB_VERSION}-src.tar.gz
+
+FROM golang:${GO_VERSION} AS backend-builder
+RUN apk update && apk add --no-cache git make gcc g++ musl-dev
+WORKDIR /app
+ENV GOPROXY=direct
+ENV GOSUMDB=off
+ENV GOPRIVATE=*
+COPY go.mod go.sum ./
+RUN for i in 1 2 3 4 5; do \
+    go mod download && break || \
+    (echo "Retry $i/5, waiting 10s..." && sleep 10); \
+    done
+COPY . .
+COPY --from=ta-lib-builder /usr/local /usr/local
+ENV CGO_ENABLED=1 GOOS=linux
+ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
+RUN go build -trimpath -ldflags="-s -w" -o nofx .
+
+FROM alpine:${ALPINE_VERSION}
+RUN apk update && apk add --no-cache ca-certificates tzdata nginx curl sed
+WORKDIR /app
+COPY --from=backend-builder /app/nofx /app/nofx
+COPY --from=web-builder /build/dist /usr/share/nginx/html
+COPY prompts /app/prompts
+COPY config.json.example /app/config.json.example
+COPY nginx.main.conf /etc/nginx/nginx.conf
+COPY nginx.hf.conf /etc/nginx/http.d/default.conf
+RUN rm -rf /etc/nginx/conf.d && \
+    mkdir -p /data/decision_logs /data/prompts /app/logs && \
+    echo '#!/bin/sh' > /app/start.sh && \
+    echo 'set -e' >> /app/start.sh && \
+    echo 'mkdir -p /data/decision_logs /data/prompts /app/logs' >> /app/start.sh && \
+    echo 'if [ ! -f /data/config.json ]; then' >> /app/start.sh && \
+    echo '  cp /app/config.json.example /data/config.json' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo 'chmod +x /app/nofx' >> /app/start.sh && \
+    echo 'export HF_HOME=/data' >> /app/start.sh && \
+    echo 'export NOFX_DB_PATH=/data/config.db' >> /app/start.sh && \
+    echo 'export NOFX_LOG_DIR=/data/decision_logs' >> /app/start.sh && \
+    echo 'export PORT=${PORT:-7860}' >> /app/start.sh && \
+    echo 'rm -rf /etc/nginx/conf.d' >> /app/start.sh && \
+    echo 'sed -i "s/\${PORT:-7860}/$PORT/g" /etc/nginx/http.d/default.conf' >> /app/start.sh && \
+    echo '/app/nofx /data/config.db 2>&1 | tee -a /app/logs/nofx.log &' >> /app/start.sh && \
+    echo 'BACKEND_PID=$!' >> /app/start.sh && \
+    echo 'sleep 3' >> /app/start.sh && \
+    echo 'nginx -g "daemon off;" &' >> /app/start.sh && \
+    echo 'NGINX_PID=$!' >> /app/start.sh && \
+    echo 'wait $BACKEND_PID $NGINX_PID' >> /app/start.sh && \
+    chmod +x /app/start.sh
+VOLUME ["/data"]
+ENV NOFX_TIMEZONE=Asia/Shanghai
+ENV PORT=7860
+ENV HF_HOME=/data
+EXPOSE 7860
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:${PORT}/api/health || exit 1
+CMD ["/app/start.sh"]
+
