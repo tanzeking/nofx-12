@@ -3,14 +3,14 @@ ARG NODE_VERSION=20-alpine
 ARG ALPINE_VERSION=3.19
 ARG TA_LIB_VERSION=0.4.0
 
-FROM --platform=linux/amd64 node:${NODE_VERSION} AS web-builder
+FROM node:${NODE_VERSION} AS web-builder
 WORKDIR /build
 COPY web/package*.json ./
 RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM --platform=linux/amd64 alpine:${ALPINE_VERSION} AS ta-lib-builder
+FROM alpine:${ALPINE_VERSION} AS ta-lib-builder
 ARG TA_LIB_VERSION
 RUN apk update && apk add --no-cache wget tar make gcc g++ musl-dev autoconf automake
 WORKDIR /tmp
@@ -29,7 +29,7 @@ RUN wget --no-check-certificate https://sourceforge.net/projects/ta-lib/files/ta
     make && make install && \
     cd .. && rm -rf ta-lib ta-lib-${TA_LIB_VERSION}-src.tar.gz
 
-FROM --platform=linux/amd64 golang:${GO_VERSION} AS backend-builder
+FROM golang:${GO_VERSION} AS backend-builder
 RUN apk update && apk add --no-cache git make gcc g++ musl-dev
 WORKDIR /app
 ENV GOPROXY=direct
@@ -46,7 +46,7 @@ ENV CGO_ENABLED=1 GOOS=linux
 ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
 RUN go build -trimpath -ldflags="-s -w" -o nofx .
 
-FROM --platform=linux/amd64 alpine:${ALPINE_VERSION}
+FROM alpine:${ALPINE_VERSION}
 RUN apk update && apk add --no-cache ca-certificates tzdata nginx curl sed
 WORKDIR /app
 COPY --from=backend-builder /app/nofx /app/nofx
