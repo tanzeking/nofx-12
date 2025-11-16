@@ -1,0 +1,167 @@
+# 单镜像 Dockerfile - 前端+后端+反代
+# 用于爪云VPS一键部署
+
+ARG GO_VERSION=1.25-alpine
+ARG NODE_VERSION=20-alpine
+ARG NGINX_VERSION=alpine
+ARG ALPINE_VERSION=latest
+ARG TA_LIB_VERSION=0.4.0
+
+# ──────────────────────────────────────────────────────────────
+# 1) 构建前端
+# ──────────────────────────────────────────────────────────────
+FROM node:${NODE_VERSION} AS web-builder
+WORKDIR /build
+COPY web/package*.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ──────────────────────────────────────────────────────────────
+# 2) 构建 TA-Lib（后端需要）
+# ──────────────────────────────────────────────────────────────
+FROM alpine:${ALPINE_VERSION} AS ta-lib-builder
+ARG TA_LIB_VERSION
+
+# 配置 Alpine 镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories || \
+    echo "https://mirrors.aliyun.com/alpine/v3.22/main" > /etc/apk/repositories && \
+    echo "https://mirrors.aliyun.com/alpine/v3.22/community" >> /etc/apk/repositories
+
+RUN apk update && apk add --no-cache wget tar make gcc g++ musl-dev autoconf automake
+
+WORKDIR /tmp
+RUN wget --no-check-certificate https://sourceforge.net/projects/ta-lib/files/ta-lib/${TA_LIB_VERSION}/ta-lib-${TA_LIB_VERSION}-src.tar.gz/download -O ta-lib-${TA_LIB_VERSION}-src.tar.gz || \
+    wget https://downloads.sourceforge.net/project/ta-lib/ta-lib/${TA_LIB_VERSION}/ta-lib-${TA_LIB_VERSION}-src.tar.gz -O ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
+    tar -xzf ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
+    cd ta-lib && \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        CONFIG_GUESS=$(find /usr/share -name config.guess | head -1) && \
+        CONFIG_SUB=$(find /usr/share -name config.sub | head -1) && \
+        cp "$CONFIG_GUESS" config.guess && \
+        cp "$CONFIG_SUB" config.sub && \
+        chmod +x config.guess config.sub; \
+    fi && \
+    ./configure --prefix=/usr/local && \
+    make && make install && \
+    cd .. && rm -rf ta-lib ta-lib-${TA_LIB_VERSION}-src.tar.gz
+
+# ──────────────────────────────────────────────────────────────
+# 3) 构建后端
+# ──────────────────────────────────────────────────────────────
+FROM golang:${GO_VERSION} AS backend-builder
+
+# 配置 Alpine 镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories || \
+    echo "https://mirrors.aliyun.com/alpine/v3.22/main" > /etc/apk/repositories && \
+    echo "https://mirrors.aliyun.com/alpine/v3.22/community" >> /etc/apk/repositories
+
+RUN apk update && apk add --no-cache git make gcc g++ musl-dev
+
+WORKDIR /app
+
+# 配置 Go 代理（直接模式，需要VPN支持）
+ENV GOPROXY=direct
+ENV GOSUMDB=off
+ENV GOPRIVATE=*
+
+COPY go.mod go.sum ./
+# 增加重试逻辑和超时时间
+RUN for i in 1 2 3 4 5; do \
+    go mod download && break || \
+    (echo "尝试 $i/5 失败，等待10秒后重试..." && sleep 10); \
+    done
+
+COPY . .
+COPY --from=ta-lib-builder /usr/local /usr/local
+
+ENV CGO_ENABLED=1 GOOS=linux
+ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
+RUN go build -trimpath -ldflags="-s -w" -o nofx .
+
+# ──────────────────────────────────────────────────────────────
+# 4) 运行镜像：Nginx(前端) + 后端（supervisord 托管）
+# ──────────────────────────────────────────────────────────────
+FROM alpine:${ALPINE_VERSION}
+
+# 配置 Alpine 镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories || \
+    echo "https://mirrors.aliyun.com/alpine/v3.22/main" > /etc/apk/repositories && \
+    echo "https://mirrors.aliyun.com/alpine/v3.22/community" >> /etc/apk/repositories
+
+RUN apk update && apk add --no-cache ca-certificates tzdata nginx curl
+
+WORKDIR /app
+
+# 后端二进制与前端静态资源
+COPY --from=backend-builder /app/nofx /app/nofx
+COPY --from=web-builder /build/dist /usr/share/nginx/html
+
+# 拷贝 prompts 供后端使用
+COPY prompts /app/prompts
+
+# 拷贝 config.json.example 作为默认配置（如果不存在则使用）
+COPY config.json.example /app/config.json.example
+
+# Nginx 配置
+COPY nginx.main.conf /etc/nginx/nginx.conf
+COPY nginx.aio.conf /etc/nginx/http.d/default.conf
+
+# 创建启动脚本（直接在镜像中创建，避免BOM和行结束符问题）
+RUN echo '#!/bin/sh' > /app/start.sh && \
+    echo 'set -e' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Create logs directory' >> /app/start.sh && \
+    echo 'mkdir -p /app/logs' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Auto-create config.json if not exists' >> /app/start.sh && \
+    echo 'if [ ! -f /app/config.json ]; then' >> /app/start.sh && \
+    echo '  echo "Creating config.json from example..."' >> /app/start.sh && \
+    echo '  cp /app/config.json.example /app/config.json' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Ensure nofx is executable' >> /app/start.sh && \
+    echo 'chmod +x /app/nofx' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Start backend service (background) with log redirection' >> /app/start.sh && \
+    echo 'echo "Starting backend service..."' >> /app/start.sh && \
+    echo 'LOG_FILE="/app/logs/nofx_$(date +%Y%m%d_%H%M%S).log"' >> /app/start.sh && \
+    echo 'echo "Backend logs will be saved to: $LOG_FILE"' >> /app/start.sh && \
+    echo 'echo "You can also view logs with: docker logs <container_id>"' >> /app/start.sh && \
+    echo '/app/nofx 2>&1 | tee -a "$LOG_FILE" &' >> /app/start.sh && \
+    echo 'BACKEND_PID=$!' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Wait for backend to start' >> /app/start.sh && \
+    echo 'sleep 2' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Start Nginx (foreground, keep container alive)' >> /app/start.sh && \
+    echo 'echo "Starting Nginx..."' >> /app/start.sh && \
+    echo 'nginx -g "daemon off;" &' >> /app/start.sh && \
+    echo 'NGINX_PID=$!' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'echo "All services started (Backend PID: $BACKEND_PID, Nginx PID: $NGINX_PID)"' >> /app/start.sh && \
+    echo 'echo "Backend log file: $LOG_FILE"' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Wait for any process to exit' >> /app/start.sh && \
+    echo 'wait $BACKEND_PID $NGINX_PID' >> /app/start.sh && \
+    chmod +x /app/start.sh
+
+# 创建日志目录
+RUN mkdir -p /app/logs
+
+# 数据卷（可选挂载）
+VOLUME ["/app/decision_logs"]
+VOLUME ["/app/prompts"]
+VOLUME ["/app/logs"]
+
+# 环境变量（可在 docker run 覆盖）
+ENV NOFX_TIMEZONE=Asia/Shanghai
+ENV NOFX_ADMIN_PASSWORD=12311
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost/api/health || exit 1
+
+CMD ["/app/start.sh"]
+

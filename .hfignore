@@ -1,0 +1,47 @@
+# Hugging Face Spaces ignore file
+# 类似于 .gitignore，但用于 Hugging Face Spaces
+
+# 编译产物
+nofx
+*.exe
+*.test
+*.out
+
+# 临时文件
+*.log
+*.tmp
+*.bak
+*.backup
+
+# 环境变量
+.env
+config.json
+config.db
+
+# 决策日志（使用持久化存储）
+decision_logs/
+coin_pool_cache/
+
+# Node.js
+web/node_modules/
+node_modules/
+web/.vite/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Git
+.git/
+.gitignore
+
+# Docker（Hugging Face 会自动处理）
+Dockerfile.hf
+docker-compose.yml
+
+# 文档（可选，根据需要）
+docs/
+*.md
+!README.hf.md
+

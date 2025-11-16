@@ -1,0 +1,158 @@
+# Hugging Face Spaces Dockerfile
+# 用于一键部署到 Hugging Face Spaces
+
+ARG GO_VERSION=1.25-alpine
+ARG NODE_VERSION=20-alpine
+ARG ALPINE_VERSION=latest
+ARG TA_LIB_VERSION=0.4.0
+
+# ──────────────────────────────────────────────────────────────
+# 1) 构建前端
+# ──────────────────────────────────────────────────────────────
+FROM node:${NODE_VERSION} AS web-builder
+WORKDIR /build
+COPY web/package*.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ──────────────────────────────────────────────────────────────
+# 2) 构建 TA-Lib（后端需要）
+# ──────────────────────────────────────────────────────────────
+FROM alpine:${ALPINE_VERSION} AS ta-lib-builder
+ARG TA_LIB_VERSION
+
+RUN apk update && apk add --no-cache wget tar make gcc g++ musl-dev autoconf automake
+
+WORKDIR /tmp
+RUN wget --no-check-certificate https://sourceforge.net/projects/ta-lib/files/ta-lib/${TA_LIB_VERSION}/ta-lib-${TA_LIB_VERSION}-src.tar.gz/download -O ta-lib-${TA_LIB_VERSION}-src.tar.gz || \
+    wget https://downloads.sourceforge.net/project/ta-lib/ta-lib/${TA_LIB_VERSION}/ta-lib-${TA_LIB_VERSION}-src.tar.gz -O ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
+    tar -xzf ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
+    cd ta-lib && \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        CONFIG_GUESS=$(find /usr/share -name config.guess | head -1) && \
+        CONFIG_SUB=$(find /usr/share -name config.sub | head -1) && \
+        cp "$CONFIG_GUESS" config.guess && \
+        cp "$CONFIG_SUB" config.sub && \
+        chmod +x config.guess config.sub; \
+    fi && \
+    ./configure --prefix=/usr/local && \
+    make && make install && \
+    cd .. && rm -rf ta-lib ta-lib-${TA_LIB_VERSION}-src.tar.gz
+
+# ──────────────────────────────────────────────────────────────
+# 3) 构建后端
+# ──────────────────────────────────────────────────────────────
+FROM golang:${GO_VERSION} AS backend-builder
+
+RUN apk update && apk add --no-cache git make gcc g++ musl-dev
+
+WORKDIR /app
+
+ENV GOPROXY=direct
+ENV GOSUMDB=off
+ENV GOPRIVATE=*
+
+COPY go.mod go.sum ./
+RUN for i in 1 2 3 4 5; do \
+    go mod download && break || \
+    (echo "尝试 $i/5 失败，等待10秒后重试..." && sleep 10); \
+    done
+
+COPY . .
+COPY --from=ta-lib-builder /usr/local /usr/local
+
+ENV CGO_ENABLED=1 GOOS=linux
+ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
+RUN go build -trimpath -ldflags="-s -w" -o nofx .
+
+# ──────────────────────────────────────────────────────────────
+# 4) 运行镜像：Nginx(前端) + 后端
+# ──────────────────────────────────────────────────────────────
+FROM alpine:${ALPINE_VERSION}
+
+RUN apk update && apk add --no-cache ca-certificates tzdata nginx curl
+
+WORKDIR /app
+
+# 后端二进制与前端静态资源
+COPY --from=backend-builder /app/nofx /app/nofx
+COPY --from=web-builder /build/dist /usr/share/nginx/html
+
+# 拷贝 prompts 供后端使用
+COPY prompts /app/prompts
+
+# 拷贝 config.json.example 作为默认配置
+COPY config.json.example /app/config.json.example
+
+# Nginx 配置（Hugging Face 使用 7860 端口）
+COPY nginx.main.conf /etc/nginx/nginx.conf
+COPY nginx.hf.conf /etc/nginx/http.d/default.conf
+
+# 创建启动脚本
+RUN echo '#!/bin/sh' > /app/start.sh && \
+    echo 'set -e' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Create data directories (Hugging Face persistent storage)' >> /app/start.sh && \
+    echo 'mkdir -p /data/decision_logs' >> /app/start.sh && \
+    echo 'mkdir -p /data/prompts' >> /app/start.sh && \
+    echo 'mkdir -p /app/logs' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Auto-create config.json if not exists' >> /app/start.sh && \
+    echo 'if [ ! -f /data/config.json ]; then' >> /app/start.sh && \
+    echo '  echo "Creating config.json from example..."' >> /app/start.sh && \
+    echo '  cp /app/config.json.example /data/config.json' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Ensure nofx is executable' >> /app/start.sh && \
+    echo 'chmod +x /app/nofx' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Set Hugging Face environment variables' >> /app/start.sh && \
+    echo 'export HF_HOME=/data' >> /app/start.sh && \
+    echo 'export NOFX_DB_PATH=/data/config.db' >> /app/start.sh && \
+    echo 'export NOFX_LOG_DIR=/data/decision_logs' >> /app/start.sh && \
+    echo 'export PORT=${PORT:-7860}' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Replace PORT in nginx config' >> /app/start.sh && \
+    echo 'sed -i "s/\${PORT:-7860}/$PORT/g" /etc/nginx/http.d/default.conf' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Start backend service (background)' >> /app/start.sh && \
+    echo 'echo "Starting backend service on port $PORT..."' >> /app/start.sh && \
+    echo '/app/nofx /data/config.db 2>&1 | tee -a /app/logs/nofx.log &' >> /app/start.sh && \
+    echo 'BACKEND_PID=$!' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Wait for backend to start' >> /app/start.sh && \
+    echo 'sleep 3' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Start Nginx (foreground, keep container alive)' >> /app/start.sh && \
+    echo 'echo "Starting Nginx on port $PORT..."' >> /app/start.sh && \
+    echo 'nginx -g "daemon off;" &' >> /app/start.sh && \
+    echo 'NGINX_PID=$!' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'echo "All services started (Backend PID: $BACKEND_PID, Nginx PID: $NGINX_PID)"' >> /app/start.sh && \
+    echo 'echo "Backend API: http://localhost:$PORT/api"' >> /app/start.sh && \
+    echo 'echo "Frontend: http://localhost:$PORT"' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Wait for any process to exit' >> /app/start.sh && \
+    echo 'wait $BACKEND_PID $NGINX_PID' >> /app/start.sh && \
+    chmod +x /app/start.sh
+
+# 创建数据目录（Hugging Face 持久化存储）
+RUN mkdir -p /data/decision_logs /data/prompts /app/logs
+
+# 数据卷（Hugging Face 持久化存储）
+VOLUME ["/data"]
+
+# 环境变量
+ENV NOFX_TIMEZONE=Asia/Shanghai
+ENV PORT=7860
+ENV HF_HOME=/data
+
+# Hugging Face Spaces 使用 7860 端口
+EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:${PORT}/api/health || exit 1
+
+CMD ["/app/start.sh"]
+
