@@ -13,6 +13,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { getExchangeIcon } from './ExchangeIcons'
 import { getModelIcon } from './ModelIcons'
 import { TraderConfigModal } from './TraderConfigModal'
+import { GUIDE_IMAGE } from '../assets/imageData'
 import {
   Bot,
   Brain,
@@ -2522,7 +2523,7 @@ function ExchangeConfigModal({
             </div>
             <div className="overflow-y-auto max-h-[80vh]">
               <img
-                src="/images/guide.png"
+                src={GUIDE_IMAGE}
                 alt={t('binanceSetupGuide', language)}
                 className="w-full h-auto rounded"
               />

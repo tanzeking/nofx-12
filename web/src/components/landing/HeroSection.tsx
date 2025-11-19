@@ -3,6 +3,7 @@ import { Sparkles } from 'lucide-react'
 import { t, Language } from '../../i18n/translations'
 import { useGitHubStats } from '../../hooks/useGitHubStats'
 import { useCounterAnimation } from '../../hooks/useCounterAnimation'
+import { HAND_BG_IMAGE, HAND_IMAGE } from '../../assets/imageData'
 
 interface HeroSectionProps {
   language: Language
@@ -185,7 +186,7 @@ export default function HeroSection({ language }: HeroSectionProps) {
           >
             {/* Background Layer */}
             <motion.img
-              src="/images/hand-bg.png"
+              src={HAND_BG_IMAGE}
               alt="NOFX Platform Background"
               className="w-full opacity-90"
               style={{ opacity, scale }}
@@ -195,7 +196,7 @@ export default function HeroSection({ language }: HeroSectionProps) {
 
             {/* Hand Layer - Animated */}
             <motion.img
-              src="/images/hand.png"
+              src={HAND_IMAGE}
               alt="Robot Hand"
               className="absolute top-0 left-0 w-full"
               style={{ opacity }}
